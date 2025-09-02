@@ -1,238 +1,201 @@
+require("dotenv").config();
+const express = require("express");
+const { createClient } = require("@supabase/supabase-js");
+const crypto = require("crypto");
+const helmet = require("helmet");
 
-const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
-const crypto = require('crypto');
-const rateLimit = require('express-rate-limit');
-
-// --- Environment Variables ---
-const {
-  SUPABASE_URL,
-  SUPABASE_KEY,
-  PSK,
-  API_KEYS,
-  CRON_SECRET
-} = process.env;
-
-// --- Constants ---
-const DAILY_API_KEY_LIMIT = 90;
-const DAILY_DEMO_LIMIT = 5;
-const LIFETIME_DEMO_LIMIT = 50; // Optional: set to a high number to disable
-const ALGORITHM = 'aes-256-cbc';
-
-// --- Initialization ---
+// Initialize Express
 const app = express();
+app.set('trust proxy', true);
 app.use(express.json());
+app.use(helmet());
 
-// Initialize Supabase client
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+// Supabase client
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// --- Helper Functions ---
+// Helper: Get current UTC date (YYYY-MM-DD)
+const getUTCDate = () => new Date().toISOString().split("T")[0];
 
-/**
- * Returns the current date in 'YYYY-MM-DD' format in UTC.
- */
-const getUTCDate = () => {
-  const now = new Date();
-  return now.toISOString().split('T')[0];
+// Helper: Generate HMAC
+const generateHmac = (deviceId, secret) => {
+  return crypto
+    .createHmac("sha256", secret)
+    .update(deviceId)
+    .digest("base64");
 };
 
-/**
- * Encrypts a string using AES-256-CBC.
- * @param {string} text - The text to encrypt.
- * @returns {string} The encrypted text in 'iv:encryptedData' hex format.
- */
-const encrypt = (text) => {
+// Helper: Validate HMAC
+const validateHmac = (deviceId, hmac) => {
+  const generatedHmac = generateHmac(deviceId, process.env.PSK);
+  return crypto.timingSafeEqual(
+    Buffer.from(generatedHmac),
+    Buffer.from(hmac)
+  );
+};
+
+// Helper: Encrypt API key
+const encryptKey = (key) => {
   const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv(ALGORITHM, Buffer.from(PSK, 'utf8'), iv);
-  let encrypted = cipher.update(text);
-  encrypted = Buffer.concat([encrypted, cipher.final()]);
-  return `${iv.toString('hex')}:${encrypted.toString('hex')}`;
+  const cipher = crypto.createCipheriv(
+    "aes-256-cbc",
+    crypto.createHash("sha256").update(process.env.PSK).digest(),
+    iv
+  );
+  const encrypted = Buffer.concat([
+    cipher.update(key, "utf8"),
+    cipher.final(),
+  ]);
+  return `${iv.toString("hex")}:${encrypted.toString("hex")}`;
 };
 
-/**
- * Validates an HMAC-SHA256 signature.
- * @param {string} deviceId - The device ID used in the HMAC.
- * @param {string} hmac_base64 - The base64 encoded HMAC from the client.
- * @returns {boolean} True if the HMAC is valid, false otherwise.
- */
-const validateHmac = (deviceId, hmac_base64) => {
-  try {
-    const generated_hmac = crypto.createHmac('sha256', PSK).update(deviceId).digest('base64');
-    return crypto.timingSafeEqual(Buffer.from(generated_hmac), Buffer.from(hmac_base64));
-  } catch (error) {
-    console.error('HMAC validation error:', error);
-    return false;
-  }
-};
-
-
-// --- Middleware ---
-
-// Basic rate limiting to prevent abuse
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-app.use(limiter);
-
-// Middleware to validate HMAC signature
+// Middleware: HMAC Authentication
 const hmacAuth = (req, res, next) => {
   const { deviceId, hmac } = req.body;
-
   if (!deviceId || !hmac) {
-    return res.status(400).json({ error: 'Missing deviceId or hmac' });
+    return res.status(400).json({ error: "Missing deviceId or hmac." });
   }
-
   if (!validateHmac(deviceId, hmac)) {
-    return res.status(401).json({ error: 'Invalid HMAC signature' });
+    return res.status(401).json({ error: "Invalid HMAC." });
   }
-
   next();
 };
 
+// Endpoint: Register device
+app.post("/api/register-device", async (req, res) => {
+  const { appSecret, deviceInfo } = req.body;
+  if (appSecret !== process.env.APP_SECRET) {
+    return res.status(401).json({ error: "Invalid app secret." });
+  }
+  const deviceId = `device_${crypto.randomBytes(16).toString("hex")}`;
+  try {
+    const { error } = await supabase.from("demo_usage").upsert({
+      device_id: deviceId,
+      uses: 0,
+      last_reset: getUTCDate(),
+      lifetime_uses: 0,
+      device_info: deviceInfo,
+    });
+    if (error) throw error;
+    return res.status(200).json({ deviceId });
+  } catch (err) {
+    console.error("Registration error:", err);
+    return res.status(500).json({ error: "Registration failed." });
+  }
+});
 
-// --- API Routes ---
-
-/**
- * POST /api/get-api-key
- * The main endpoint for clients to request an encrypted API key.
- */
-app.post('/api/get-api-key', hmacAuth, async (req, res) => {
+// Endpoint: Get API key
+app.post("/api/get-api-key", hmacAuth, async (req, res) => {
   const { deviceId } = req.body;
   const today = getUTCDate();
-
   try {
-    // 1. --- Demo Usage Check ---
-    let { data: demoUser, error: demoError } = await supabase
-      .from('demo_usage')
-      .select('*')
-      .eq('device_id', deviceId)
+    // Check demo limits
+    const { data: demoUser, error: demoError } = await supabase
+      .from("demo_usage")
+      .select("*")
+      .eq("device_id", deviceId)
       .single();
-
-    if (demoError && demoError.code !== 'PGRST116') { // PGRST116 = 'not found'
-      throw new Error(`Supabase demo_usage select error: ${demoError.message}`);
-    }
-
+    if (demoError && demoError.code !== "PGRST116") throw demoError;
     if (demoUser) {
-      // Optional: Check for lifetime demo uses
-      // if (demoUser.lifetime_uses >= LIFETIME_DEMO_LIMIT) {
-      //   return res.status(403).json({ error: 'Lifetime demo limit reached.' });
-      // }
-      
-      if (demoUser.last_reset === today && demoUser.uses >= DAILY_DEMO_LIMIT) {
-        return res.status(403).json({ error: 'Daily demo limit reached. Try again tomorrow.' });
+      if (demoUser.last_reset === today && demoUser.uses >= 5) {
+        return res.status(403).json({ error: "Daily demo limit reached." });
+      }
+      if (demoUser.lifetime_uses >= 50) {
+        return res.status(403).json({ error: "Lifetime demo limit reached." });
       }
     }
-
-    // 2. --- API Key Selection ---
-    const availableKeys = JSON.parse(API_KEYS);
-    let { data: keyUsage, error: keyUsageError } = await supabase
-      .from('key_usage')
-      .select('*');
-
-    if (keyUsageError) {
-      throw new Error(`Supabase key_usage select error: ${keyUsageError.message}`);
-    }
-
+    // Select API key (round-robin)
+    const apiKeys = JSON.parse(process.env.API_KEYS);
+    const { data: keyUsage, error: keyUsageError } = await supabase
+      .from("key_usage")
+      .select("*");
+    if (keyUsageError) throw keyUsageError;
+    const { data: rotationState, error: rotationError } = await supabase
+      .from("rotation_state")
+      .select("*")
+      .eq("id", 1)
+      .single();
+    if (rotationError) throw rotationError;
+    let index = (rotationState?.last_used_index || -1) + 1;
     let selectedKey = null;
-    let hitsRemaining = 0;
-
-    for (const key of availableKeys) {
-      const usage = keyUsage.find(k => k.key === key);
-      const currentHits = (usage && usage.last_reset === today) ? usage.hits : 0;
-
-      if (currentHits < DAILY_API_KEY_LIMIT) {
+    let attempts = 0;
+    while (attempts < apiKeys.length) {
+      const keyIndex = index % apiKeys.length;
+      const key = apiKeys[keyIndex];
+      const usage = keyUsage?.find((k) => k.key === key);
+      const hits = usage?.last_reset === today ? usage.hits : 0;
+      if (hits < 90) {
         selectedKey = key;
-        hitsRemaining = DAILY_API_KEY_LIMIT - (currentHits + 1);
         break;
       }
+      index++;
+      attempts++;
     }
-
     if (!selectedKey) {
-      return res.status(429).json({ error: 'All API keys have reached their daily limit. Please try again later.' });
+      return res.status(429).json({ error: "All API keys exhausted." });
     }
-
-    // 3. --- Update Metrics in Supabase ---
-    const keyPromise = supabase.from('key_usage').upsert({
+    // Update rotation state
+    const newIndex = (index % apiKeys.length);
+    const { error: updateError } = await supabase
+      .from("rotation_state")
+      .upsert({ id: 1, last_used_index: newIndex, last_reset: today });
+    if (updateError) throw updateError;
+    // Update usage metrics
+    const { error: usageError } = await supabase.from("key_usage").upsert({
       key: selectedKey,
-      hits: (keyUsage.find(k => k.key === selectedKey && k.last_reset === today)?.hits || 0) + 1,
+      hits: (keyUsage?.find((k) => k.key === selectedKey)?.hits || 0) + 1,
       last_reset: today,
     });
-
-    const remainingDemoUses = demoUser?.last_reset === today ? DAILY_DEMO_LIMIT - (demoUser.uses + 1) : DAILY_DEMO_LIMIT - 1;
-    const demoPromise = supabase.from('demo_usage').upsert({
-        device_id: deviceId,
-        uses: (demoUser?.last_reset === today ? demoUser.uses : 0) + 1,
-        last_reset: today,
-        lifetime_uses: (demoUser?.lifetime_uses || 0) + 1,
+    if (usageError) throw usageError;
+    const { error: demoUpdateError } = await supabase.from("demo_usage").upsert({
+      device_id: deviceId,
+      uses: (demoUser?.uses || 0) + 1,
+      last_reset: today,
+      lifetime_uses: (demoUser?.lifetime_uses || 0) + 1,
     });
-
-    const [keyResult, demoResult] = await Promise.all([keyPromise, demoPromise]);
-
-    if (keyResult.error) throw new Error(`Supabase key_usage upsert error: ${keyResult.error.message}`);
-    if (demoResult.error) throw new Error(`Supabase demo_usage upsert error: ${demoResult.error.message}`);
-
-    // 4. --- Encrypt and Respond ---
-    const encryptedKey = encrypt(selectedKey);
-
+    if (demoUpdateError) throw demoUpdateError;
+    // Encrypt and return the key
     return res.status(200).json({
-      encryptedKey,
+      encryptedKey: encryptKey(selectedKey),
       demoMode: true,
-      remainingDemoUses,
-      hitsRemaining,
+      remainingDemoUses: 5 - ((demoUser?.uses || 0) + 1),
+      hitsRemaining: 90 - ((keyUsage?.find((k) => k.key === selectedKey)?.hits || 0) + 1),
     });
-
-  } catch (error) {
-    console.error('Error in /api/get-api-key:', error.message);
-    return res.status(500).json({ error: 'Internal Server Error' });
+  } catch (err) {
+    console.error("Error:", err);
+    return res.status(500).json({ error: "Internal server error." });
   }
 });
 
-/**
- * GET /api/reset-metrics
- * A Vercel cron job triggers this endpoint to reset daily counters.
- */
-app.get('/api/reset-metrics', async (req, res) => {
-  // Protect the endpoint with a secret
-  const cronSecret = req.headers['x-cron-secret'];
-  if (cronSecret !== CRON_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
+// Endpoint: Reset daily metrics (cron job)
+app.get("/api/reset-metrics", async (req, res) => {
+  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized." });
   }
-
   const today = getUTCDate();
-  console.log(`Running daily reset for ${today}...`);
-
   try {
-    // Reset hits for all keys
-    const { error: keyResetError } = await supabase
-      .from('key_usage')
-      .update({ hits: 0, last_reset: today });
-
-    if (keyResetError) {
-      throw new Error(`Supabase key_usage reset error: ${keyResetError.message}`);
-    }
-
-    // Delete old demo usage records
-    const { error: demoResetError } = await supabase
-      .from('demo_usage')
+    const { error: keyUsageError } = await supabase
+      .from("key_usage")
+      .update({ hits: 0, last_reset: today })
+      .gte("id", 0);
+    if (keyUsageError) throw keyUsageError;
+    const { error: demoUsageError } = await supabase
+      .from("demo_usage")
       .delete()
-      .neq('last_reset', today);
-
-    if (demoResetError) {
-      throw new Error(`Supabase demo_usage cleanup error: ${demoResetError.message}`);
-    }
-    
-    console.log('Daily metrics reset successfully.');
-    return res.status(200).json({ message: 'Daily metrics reset successfully.' });
-
-  } catch (error) {
-    console.error('Error in /api/reset-metrics:', error.message);
-    return res.status(500).json({ error: 'Internal Server Error during reset.' });
+      .neq("last_reset", today);
+    if (demoUsageError) throw demoUsageError;
+    const { error: rotationError } = await supabase
+      .from("rotation_state")
+      .upsert({ id: 1, last_used_index: -1, last_reset: today });
+    if (rotationError) throw rotationError;
+    return res.status(200).json({ message: "Metrics reset successfully." });
+  } catch (err) {
+    console.error("Reset error:", err);
+    return res.status(500).json({ error: "Reset failed." });
   }
 });
 
-// Export the app for Vercel
-module.exports = app;
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
