@@ -1,3 +1,15 @@
+# Recent Changes & Improvements (September 2025)
+
+- **Database-Driven Key Management**: API keys are now managed in the Supabase `api_keys` table, supporting activation/deactivation and metadata.
+- **Automated Daily Reset**: The Supabase schema now includes triggers and functions for automatic daily reset of usage counters and rotation state.
+- **Enhanced Demo Usage Tracking**: The `demo_usage` table now tracks device info, daily and lifetime usage, and supports automatic resets.
+- **Key Rotation State**: Added a `rotation_state` table to track which key was last used, ensuring fair rotation.
+- **Improved Security**: All tables use Row Level Security (RLS) and policies for server-side access.
+- **Expanded SQL Schema**: The new `schema.sql` file provides a comprehensive setup for all tables, triggers, and sample data.
+- **API Changes**: The `/api/get-api-key` endpoint now returns encrypted keys, remaining demo uses, and hits remaining for the selected key.
+- **Error Handling**: Improved error messages for rate limits, exhausted keys, and invalid HMAC.
+- **Environment Variables**: Updated `.env.example` and usage instructions for new variables and structure.
+
 # Secure API Key Rotation Proxy
 
 This project implements a secure, server-side API key rotation proxy using Node.js and Express. It's designed for deployment on Vercel and uses Supabase (PostgreSQL) for storing usage metrics.
