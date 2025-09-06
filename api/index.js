@@ -122,40 +122,24 @@ app.post("/api/get-api-key", hmacAuth, async (req, res) => {
       .select("*");
     if (keyUsageError) throw keyUsageError;
 
-    const { data: rotationData, error: rotationError } = await supabase
-      .from("rotation_state")
-      .select("*")
-      .eq("id", 1)
-      .single();
-    if (rotationError && rotationError.code !== "PGRST116") throw rotationError;
-
-    let index = (rotationData?.last_used_index || -1) + 1;
-    let selectedKey = null;
-    let attempts = 0;
-
-    while (attempts < apiKeys.length) {
-      const keyIndex = index % apiKeys.length;
-      const key = apiKeys[keyIndex];
-      const usage = keyUsage?.find((k) => k.key === key);
+    const availableKeys = apiKeys.filter(key => {
+      const usage = keyUsage?.find(k => k.key === key);
       const hits = usage?.hits || 0;
-      if (hits < 90) {
-        selectedKey = key;
-        break;
-      }
-      index++;
-      attempts++;
+      return hits < 50;
+    });
+
+    if (availableKeys.length === 0) {
+      return res.status(429).json({ error: "All API keys exhausted." });
     }
+
+    const randomIndex = Math.floor(Math.random() * availableKeys.length);
+    const selectedKey = availableKeys[randomIndex];
 
     if (!selectedKey) {
       return res.status(429).json({ error: "All API keys exhausted." });
     }
 
-    // Update rotation state
-    const newIndex = index % apiKeys.length;
-    await supabase.from("rotation_state").upsert({
-      id: 1,
-      last_used_index: newIndex,
-    });
+    
 
     // Increment key usage
     const currentKeyUsage = keyUsage?.find((k) => k.key === selectedKey);
@@ -180,7 +164,7 @@ app.post("/api/get-api-key", hmacAuth, async (req, res) => {
       encryptedKey: encryptKey(selectedKey),
       demoMode: true,
       remainingDemoUses: 5 - (currentUses + 1),
-      hitsRemaining: 90 - (currentHits + 1),
+      hitsRemaining: 50 - (currentHits + 1),
     });
   } catch (err) {
     console.error("Error:", err);
